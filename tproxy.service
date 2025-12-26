@@ -1,0 +1,23 @@
+[Unit]
+Description=Transparent HTTP/HTTPS Proxy with Clash Rules
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tproxy -config /etc/tproxy/config.yaml
+ExecStop=/usr/local/bin/tproxy -cleanup
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=false
+# Note: Needs CAP_NET_ADMIN for iptables and NET_RAW for raw socket operations
+# Running as root is required for iptables manipulation
+User=root
+Group=root
+
+# Ensure iptables cleanup on stop
+ExecStopPost=/usr/local/bin/tproxy -cleanup
+
+[Install]
+WantedBy=multi-user.target

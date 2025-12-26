@@ -1,0 +1,31 @@
+# Build output
+build/
+tproxy
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (keep example only)
+config.yaml
+!config.example.yaml
+
+# Debug
+*.log
+__debug_bin*
