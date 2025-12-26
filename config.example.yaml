@@ -1,0 +1,47 @@
+# 透明代理配置文件示例
+
+# 代理监听地址
+listen: ":12345"
+
+# 日志等级 (debug, info, warn, error)
+# log_level: debug
+
+# 上游代理地址，支持 http:// 或 socks5://
+upstream: "http://proxy.example.com:8080"
+# 或 SOCKS5 代理:
+# upstream: "socks5://proxy.example.com:1080"
+# 支持认证:
+# upstream: "http://user:password@proxy.example.com:8080"
+# upstream: "socks5://user:password@proxy.example.com:1080"
+
+# Clash 兼容规则
+# 格式: TYPE,VALUE,POLICY
+# TYPE: DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, IP-CIDR, IP-CIDR6, MATCH
+# POLICY: PROXY, DIRECT, REJECT
+rules:
+  # 直连规则 - 本地和内网地址
+  - IP-CIDR,127.0.0.0/8,DIRECT
+  - IP-CIDR,10.0.0.0/8,DIRECT
+  - IP-CIDR,172.16.0.0/12,DIRECT
+  - IP-CIDR,192.168.0.0/16,DIRECT
+
+  # 直连规则 - 中国域名
+  - DOMAIN-SUFFIX,cn,DIRECT
+  - DOMAIN-SUFFIX,local,DIRECT
+  - DOMAIN-SUFFIX,localhost,DIRECT
+
+  # 代理规则 - 需要代理的站点
+  - DOMAIN-SUFFIX,google.com,PROXY
+  - DOMAIN-SUFFIX,googleapis.com,PROXY
+  - DOMAIN-SUFFIX,gstatic.com,PROXY
+  - DOMAIN-SUFFIX,github.com,PROXY
+  - DOMAIN-SUFFIX,githubusercontent.com,PROXY
+  - DOMAIN-KEYWORD,youtube,PROXY
+  - DOMAIN-KEYWORD,twitter,PROXY
+
+  # 拒绝规则 - 广告和追踪
+  - DOMAIN-SUFFIX,ads.example.com,REJECT
+  - DOMAIN-KEYWORD,adservice,REJECT
+
+  # 默认规则 - 未匹配的流量
+  - MATCH,DIRECT
