@@ -1,34 +1,51 @@
 package proxy
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/cnfatal/proxy/config"
 	"github.com/cnfatal/proxy/rules"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
-	// SO_ORIGINAL_DST is the socket option to get the original destination
-	SO_ORIGINAL_DST = 80
+	// IP_RECVORIGDSTADDR is the socket option to receive the original destination address
+	IP_RECVORIGDSTADDR = 20
+	// IPV6_RECVORIGDSTADDR is the IPv6 version of IP_RECVORIGDSTADDR
+	IPV6_RECVORIGDSTADDR = 74
 	// SniffTimeout is the timeout for sniffing domain names
 	SniffTimeout = 150 * time.Millisecond
+	// UDPSessionCleanupInterval is the interval for cleaning up stale UDP sessions
+	UDPSessionCleanupInterval = 30 * time.Second
+	// UDPSessionTimeout is the timeout for inactive UDP sessions
+	UDPSessionTimeout = 60 * time.Second
 )
 
 // TransparentProxy handles transparent proxy connections
 type TransparentProxy struct {
-	listenAddr string
-	upstream   *Upstream
-	matcher    *rules.Matcher
-	listener   net.Listener
-	sniffer    Sniffer
-	pool       BufferPool
+	listenAddr  string
+	dnsConfig   config.DNSConfig
+	upstream    *Upstream
+	matcher     *rules.Matcher
+	udpConn     *net.UDPConn
+	sniffer     Sniffer
+	pool        BufferPool
+	udpSessions map[string]*udpSession
+	udpMu       sync.Mutex
+}
+
+type udpSession struct {
+	remoteConn net.PacketConn
+	lastActive time.Time
 }
 
 // NewTransparentProxy creates a new transparent proxy
@@ -39,80 +56,286 @@ func NewTransparentProxy(cfg *config.Config, matcher *rules.Matcher, pool Buffer
 	}
 
 	return &TransparentProxy{
-		listenAddr: cfg.Listen,
-		upstream:   upstream,
-		matcher:    matcher,
-		sniffer:    NewSniffer(pool, SniffTimeout),
-		pool:       pool,
+		listenAddr:  cfg.Listen,
+		dnsConfig:   cfg.DNS,
+		upstream:    upstream,
+		matcher:     matcher,
+		sniffer:     NewSniffer(pool, SniffTimeout),
+		pool:        pool,
+		udpSessions: make(map[string]*udpSession),
 	}
 }
 
-// Start begins listening for connections
-func (tp *TransparentProxy) Start() error {
-	listener, err := net.Listen("tcp", tp.listenAddr)
+// Run begins listening for connections and runs until context is cancelled
+func (tp *TransparentProxy) Run(ctx context.Context) error {
+	g, ctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		return tp.runTCP(ctx)
+	})
+
+	g.Go(func() error {
+		return tp.runUDP(ctx)
+	})
+
+	return g.Wait()
+}
+
+func (tp *TransparentProxy) runTCP(ctx context.Context) error {
+	// Start TCP listener with IP_TRANSPARENT to support TPROXY
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				syscall.SetsockoptInt(int(fd), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1)
+				syscall.SetsockoptInt(int(fd), syscall.SOL_TCP, syscall.TCP_NODELAY, 1)
+			})
+		},
+	}
+
+	listener, err := lc.Listen(ctx, "tcp", tp.listenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", tp.listenAddr, err)
 	}
-	tp.listener = listener
+	defer listener.Close()
 
-	slog.Info("Transparent proxy listening", "addr", tp.listenAddr)
+	slog.Info("Transparent TCP proxy listening", "addr", tp.listenAddr)
+
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				continue
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				if _, ok := err.(net.Error); ok {
+					continue
+				}
+				return err
 			}
-			return err
 		}
 
-		go tp.handleConnection(conn)
+		go tp.handleConnection(ctx, conn)
 	}
 }
 
-// Stop stops the proxy server
-func (tp *TransparentProxy) Stop() error {
-	if tp.listener != nil {
-		return tp.listener.Close()
+func (tp *TransparentProxy) runUDP(ctx context.Context) error {
+	// Start UDP listener for DNS and general UDP
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				syscall.SetsockoptInt(int(fd), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1)
+				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, IP_RECVORIGDSTADDR, 1)
+				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, IPV6_RECVORIGDSTADDR, 1)
+			})
+		},
+	}
+
+	packetConn, err := lc.ListenPacket(ctx, "udp", tp.listenAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on UDP %s: %w", tp.listenAddr, err)
+	}
+	udpConn, ok := packetConn.(*net.UDPConn)
+	if !ok {
+		return fmt.Errorf("expected *net.UDPConn, got %T", packetConn)
+	}
+	tp.udpConn = udpConn
+	defer udpConn.Close()
+
+	slog.Info("Transparent UDP proxy listening", "addr", tp.listenAddr)
+
+	go tp.cleanupUDPSessions(ctx)
+
+	go func() {
+		<-ctx.Done()
+		udpConn.Close()
+	}()
+
+	tp.udpLoop(ctx)
+	return nil
+}
+
+func (tp *TransparentProxy) udpLoop(ctx context.Context) {
+	buf := make([]byte, 65535)
+	oob := make([]byte, 1024)
+	for {
+		n, oobn, _, srcAddr, err := tp.udpConn.ReadMsgUDP(buf, oob)
+		if err != nil {
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				return
+			}
+			slog.Error("UDP read error", "error", err)
+			continue
+		}
+
+		origDst := tp.getOriginalUDPAddr(oob[:oobn])
+		if origDst == nil {
+			continue
+		}
+
+		// Loop detection: if the original destination is the proxy itself, ignore it
+		listenPort, _ := GetListenPort(tp.listenAddr)
+		if origDst.Port == listenPort {
+			if origDst.IP.IsLoopback() || origDst.IP.IsUnspecified() {
+				continue
+			}
+		}
+
+		data := make([]byte, n)
+		copy(data, buf[:n])
+
+		if origDst.Port == 53 {
+			go tp.handleDNSUDP(ctx, srcAddr, origDst, data)
+		} else {
+			go tp.handleGeneralUDP(ctx, srcAddr, origDst, data)
+		}
+	}
+}
+
+func (tp *TransparentProxy) getOriginalUDPAddr(oob []byte) *net.UDPAddr {
+	msgs, err := syscall.ParseSocketControlMessage(oob)
+	if err != nil {
+		return nil
+	}
+	for _, msg := range msgs {
+		if msg.Header.Level == syscall.IPPROTO_IP && msg.Header.Type == IP_RECVORIGDSTADDR {
+			if len(msg.Data) >= 16 {
+				port := binary.BigEndian.Uint16(msg.Data[2:4])
+				ip := net.IP(msg.Data[4:8])
+				return &net.UDPAddr{IP: ip, Port: int(port)}
+			}
+		} else if msg.Header.Level == syscall.IPPROTO_IPV6 && msg.Header.Type == IPV6_RECVORIGDSTADDR {
+			if len(msg.Data) >= 28 {
+				port := binary.BigEndian.Uint16(msg.Data[2:4])
+				ip := net.IP(msg.Data[8:24])
+				return &net.UDPAddr{IP: ip, Port: int(port)}
+			}
+		}
 	}
 	return nil
 }
 
-// handleConnection handles a single incoming connection
-func (tp *TransparentProxy) handleConnection(conn net.Conn) {
-	var client net.Conn = conn
-	defer func() {
-		if client != nil {
-			client.Close()
+func (tp *TransparentProxy) handleGeneralUDP(ctx context.Context, srcAddr net.Addr, origDst *net.UDPAddr, data []byte) {
+	key := fmt.Sprintf("%s-%s", srcAddr.String(), origDst.String())
+
+	tp.udpMu.Lock()
+	session, ok := tp.udpSessions[key]
+	if !ok {
+		// Create new session
+		lc := net.ListenConfig{
+			Control: bypassControl,
 		}
-	}()
+		remoteConn, err := lc.ListenPacket(ctx, "udp", "")
+		if err != nil {
+			tp.udpMu.Unlock()
+			slog.Error("Failed to create UDP session", "error", err)
+			return
+		}
+
+		session = &udpSession{
+			remoteConn: remoteConn,
+			lastActive: time.Now(),
+		}
+		tp.udpSessions[key] = session
+		tp.udpMu.Unlock()
+
+		// Start relay from remote to client
+		go func() {
+			buf := make([]byte, 65535)
+			for {
+				n, _, err := remoteConn.ReadFrom(buf)
+				if err != nil {
+					return
+				}
+
+				tp.udpMu.Lock()
+				session.lastActive = time.Now()
+				tp.udpMu.Unlock()
+
+				if _, err := tp.udpConn.WriteTo(buf[:n], srcAddr); err != nil {
+					return
+				}
+			}
+		}()
+	} else {
+		session.lastActive = time.Now()
+		tp.udpMu.Unlock()
+	}
+
+	_, _ = session.remoteConn.WriteTo(data, origDst)
+}
+
+func (tp *TransparentProxy) cleanupUDPSessions(ctx context.Context) {
+	ticker := time.NewTicker(UDPSessionCleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			tp.udpMu.Lock()
+			now := time.Now()
+			for key, session := range tp.udpSessions {
+				if now.Sub(session.lastActive) > UDPSessionTimeout {
+					session.remoteConn.Close()
+					delete(tp.udpSessions, key)
+				}
+			}
+			tp.udpMu.Unlock()
+		}
+	}
+}
+
+// handleConnection handles a single incoming connection
+func (tp *TransparentProxy) handleConnection(ctx context.Context, client net.Conn) {
+	defer client.Close()
 
 	// Set TCP_NODELAY to reduce latency
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
+	if tcpConn, ok := client.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
 	}
 
 	// Get the original destination address
-	origDst, err := getOriginalDst(conn)
-	if err != nil {
-		slog.Error("Failed to get original destination", "error", err)
+	origDst, ok := client.LocalAddr().(*net.TCPAddr)
+	if !ok {
+		slog.Error("Failed to get original destination: not a TCP address")
 		return
 	}
 
+	// Loop detection: if the original destination is the proxy itself, ignore it
+	// This happens if a connection is made directly to the proxy port
+	listenPort, _ := GetListenPort(tp.listenAddr)
+	if origDst.Port == listenPort {
+		if origDst.IP.IsLoopback() || origDst.IP.IsUnspecified() {
+			slog.Debug("Ignoring direct connection to proxy port", "addr", origDst.String())
+			return
+		}
+	}
+
+	if origDst.Port == 53 {
+		tp.handleDNSTCP(ctx, client)
+		return // client will be closed by handleDNSTCP
+	}
+
 	targetAddr := origDst.String()
-	clientAddr := conn.RemoteAddr().String()
+	clientAddr := client.RemoteAddr().String()
 
 	slog.Debug("New connection", "from", clientAddr, "to", targetAddr)
 
 	// Sniff domain from the connection (TLS SNI or HTTP Host)
-	domain, peeked, err := tp.sniffer.Sniff(conn)
+	domain, peeked, err := tp.sniffer.Sniff(client)
 	if err != nil {
 		slog.Debug("Failed to sniff domain", "error", err)
 	}
 
 	// Wrap the connection with peeked data so it can be read again
 	if len(peeked) > 0 {
-		client = NewPeekedConn(conn, peeked, tp.pool)
+		client = NewPeekedConn(client, peeked, tp.pool)
 	}
 
 	ip := origDst.IP
@@ -129,15 +352,15 @@ func (tp *TransparentProxy) handleConnection(conn net.Conn) {
 
 	case config.PolicyDirect:
 		slog.Debug("Direct connection", "target", targetAddr, "domain", domain)
-		serverConn, err = DirectConnect(targetAddr)
+		serverConn, err = DirectConnect(ctx, targetAddr)
 
 	case config.PolicyProxy:
 		if tp.upstream == nil {
 			slog.Warn("No upstream proxy configured, using direct connection")
-			serverConn, err = DirectConnect(targetAddr)
+			serverConn, err = DirectConnect(ctx, targetAddr)
 		} else {
 			slog.Debug("Proxying connection", "target", targetAddr, "domain", domain, "policy", result.Policy)
-			serverConn, err = tp.upstream.Connect(targetAddr)
+			serverConn, err = tp.upstream.Connect(ctx, targetAddr)
 		}
 	}
 
@@ -151,113 +374,6 @@ func (tp *TransparentProxy) handleConnection(conn net.Conn) {
 	Relay(serverConn, client, tp.pool)
 
 	slog.Debug("Relay completed", "target", targetAddr)
-}
-
-// getOriginalDst retrieves the original destination address from a redirected connection
-func getOriginalDst(conn net.Conn) (*net.TCPAddr, error) {
-	syscallConn, ok := conn.(syscall.Conn)
-	if !ok {
-		return nil, fmt.Errorf("connection does not implement syscall.Conn")
-	}
-	rawConn, err := syscallConn.SyscallConn()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get syscall conn: %w", err)
-	}
-	var addr *net.TCPAddr
-	var getErr error
-	err = rawConn.Control(func(fd uintptr) {
-		// Try IPv4 first
-		addr, getErr = getOriginalDstIPv4(int(fd))
-		if getErr == nil {
-			return
-		}
-		// Try IPv6
-		addr, getErr = getOriginalDstIPv6(int(fd))
-	})
-	if err != nil {
-		return nil, fmt.Errorf("raw conn control failed: %w", err)
-	}
-	if getErr != nil {
-		return nil, fmt.Errorf("failed to get original destination: %w", getErr)
-	}
-	return addr, nil
-}
-
-// sockaddr_in represents the C sockaddr_in structure
-type sockaddrIn struct {
-	Family uint16
-	Port   uint16
-	Addr   [4]byte
-	Zero   [8]byte
-}
-
-// sockaddr_in6 represents the C sockaddr_in6 structure
-type sockaddrIn6 struct {
-	Family   uint16
-	Port     uint16
-	Flowinfo uint32
-	Addr     [16]byte
-	ScopeID  uint32
-}
-
-// getOriginalDstIPv4 gets the original destination for IPv4
-func getOriginalDstIPv4(fd int) (*net.TCPAddr, error) {
-	var addr sockaddrIn
-	addrLen := uint32(unsafe.Sizeof(addr))
-
-	_, _, errno := syscall.Syscall6(
-		syscall.SYS_GETSOCKOPT,
-		uintptr(fd),
-		uintptr(syscall.SOL_IP),
-		uintptr(SO_ORIGINAL_DST),
-		uintptr(unsafe.Pointer(&addr)),
-		uintptr(unsafe.Pointer(&addrLen)),
-		0,
-	)
-
-	if errno != 0 {
-		return nil, errno
-	}
-
-	ip := net.IPv4(addr.Addr[0], addr.Addr[1], addr.Addr[2], addr.Addr[3])
-	port := int(binary.BigEndian.Uint16((*[2]byte)(unsafe.Pointer(&addr.Port))[:]))
-
-	return &net.TCPAddr{
-		IP:   ip,
-		Port: port,
-	}, nil
-}
-
-// IP6T_SO_ORIGINAL_DST is the IPv6 version of SO_ORIGINAL_DST
-const IP6T_SO_ORIGINAL_DST = 80
-
-// getOriginalDstIPv6 gets the original destination for IPv6
-func getOriginalDstIPv6(fd int) (*net.TCPAddr, error) {
-	var addr sockaddrIn6
-	addrLen := uint32(unsafe.Sizeof(addr))
-
-	_, _, errno := syscall.Syscall6(
-		syscall.SYS_GETSOCKOPT,
-		uintptr(fd),
-		uintptr(syscall.SOL_IPV6),
-		uintptr(IP6T_SO_ORIGINAL_DST),
-		uintptr(unsafe.Pointer(&addr)),
-		uintptr(unsafe.Pointer(&addrLen)),
-		0,
-	)
-
-	if errno != 0 {
-		return nil, errno
-	}
-
-	ip := make(net.IP, 16)
-	copy(ip, addr.Addr[:])
-	port := int(binary.BigEndian.Uint16((*[2]byte)(unsafe.Pointer(&addr.Port))[:]))
-
-	return &net.TCPAddr{
-		IP:   ip,
-		Port: port,
-	}, nil
 }
 
 // GetListenPort extracts the port number from the listen address

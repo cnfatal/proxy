@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"io"
 	"net"
 	"net/url"
@@ -79,7 +80,7 @@ func TestDirectConnect(t *testing.T) {
 	}()
 
 	// 测试 DirectConnect
-	conn, err := DirectConnect(listener.Addr().String())
+	conn, err := DirectConnect(context.Background(), listener.Addr().String())
 	if err != nil {
 		t.Fatalf("DirectConnect error = %v", err)
 	}
@@ -94,7 +95,7 @@ func TestDirectConnect(t *testing.T) {
 
 func TestDirectConnect_Failure(t *testing.T) {
 	// 尝试连接一个不存在的地址
-	_, err := DirectConnect("127.0.0.1:1") // 端口 1 通常不可用
+	_, err := DirectConnect(context.Background(), "127.0.0.1:1") // 端口 1 通常不可用
 	if err == nil {
 		t.Error("Expected error for invalid address")
 	}
@@ -161,7 +162,7 @@ func TestUpstreamHTTP_Mock(t *testing.T) {
 	upstream := NewUpstream(proxyURL)
 
 	// 测试连接
-	conn, err := upstream.Connect("example.com:80")
+	conn, err := upstream.Connect(context.Background(), "example.com:80")
 	if err != nil {
 		t.Fatalf("Connect error = %v", err)
 	}

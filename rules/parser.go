@@ -14,6 +14,7 @@ type RuleType string
 const (
 	RuleTypeDomain        RuleType = "DOMAIN"
 	RuleTypeDomainSuffix  RuleType = "DOMAIN-SUFFIX"
+	RuleTypeDomainPrefix  RuleType = "DOMAIN-PREFIX"
 	RuleTypeDomainKeyword RuleType = "DOMAIN-KEYWORD"
 	RuleTypeIPCIDR        RuleType = "IP-CIDR"
 	RuleTypeIPCIDR6       RuleType = "IP-CIDR6"
@@ -89,7 +90,7 @@ func ParseRule(ruleStr string) (*Rule, error) {
 			return nil, fmt.Errorf("invalid CIDR: %s", value)
 		}
 		rule.Network = network
-	case RuleTypeDomain, RuleTypeDomainSuffix, RuleTypeDomainKeyword, RuleTypeMatch:
+	case RuleTypeDomain, RuleTypeDomainSuffix, RuleTypeDomainPrefix, RuleTypeDomainKeyword, RuleTypeMatch:
 		// Valid rule types
 	default:
 		return nil, fmt.Errorf("unsupported rule type: %s", ruleType)

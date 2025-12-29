@@ -13,11 +13,17 @@ type Matcher struct {
 	domainTrie   *DomainTrie
 	ipTree       *IPTree
 	keywordRules []keywordRule
+	prefixRules  []prefixRule
 	matchRule    *Rule
 	matchIndex   int
 }
 
 type keywordRule struct {
+	rule  *Rule
+	index int
+}
+
+type prefixRule struct {
 	rule  *Rule
 	index int
 }
@@ -35,6 +41,8 @@ func NewMatcher(rules []*Rule) *Matcher {
 		switch rule.Type {
 		case RuleTypeDomain, RuleTypeDomainSuffix:
 			m.domainTrie.Insert(rule.Value, rule, i, rule.Type == RuleTypeDomainSuffix)
+		case RuleTypeDomainPrefix:
+			m.prefixRules = append(m.prefixRules, prefixRule{rule: rule, index: i})
 		case RuleTypeDomainKeyword:
 			m.keywordRules = append(m.keywordRules, keywordRule{rule: rule, index: i})
 		case RuleTypeIPCIDR, RuleTypeIPCIDR6:
@@ -71,7 +79,18 @@ func (m *Matcher) Match(domain string, ip net.IP) MatchResult {
 			bestIndex = idx
 		}
 
-		// 2. Check Domain Keywords
+		// 2. Check Domain Prefixes
+		for _, pr := range m.prefixRules {
+			if bestIndex != -1 && pr.index >= bestIndex {
+				break
+			}
+			if strings.HasPrefix(domain, strings.ToLower(pr.rule.Value)) {
+				bestRule = pr.rule
+				bestIndex = pr.index
+			}
+		}
+
+		// 3. Check Domain Keywords
 		for _, kr := range m.keywordRules {
 			if bestIndex != -1 && kr.index >= bestIndex {
 				break
@@ -84,7 +103,7 @@ func (m *Matcher) Match(domain string, ip net.IP) MatchResult {
 		}
 	}
 
-	// 3. Check IP Tree
+	// 4. Check IP Tree
 	if ip != nil {
 		if r, idx := m.ipTree.Search(ip); r != nil {
 			if bestIndex == -1 || idx < bestIndex {
@@ -94,7 +113,7 @@ func (m *Matcher) Match(domain string, ip net.IP) MatchResult {
 		}
 	}
 
-	// 4. Check MATCH rule
+	// 5. Check MATCH rule
 	if m.matchRule != nil {
 		if bestIndex == -1 || m.matchIndex < bestIndex {
 			bestRule = m.matchRule

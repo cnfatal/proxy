@@ -99,9 +99,12 @@ rules:
 		t.Fatal(err)
 	}
 
-	_, err := Load(configPath)
-	if err == nil {
-		t.Error("Expected error for missing upstream")
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Errorf("Load() error = %v, missing upstream should be valid", err)
+	}
+	if cfg.UpstreamURL != nil {
+		t.Error("UpstreamURL should be nil when upstream is not specified")
 	}
 }
 

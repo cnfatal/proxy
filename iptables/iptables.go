@@ -1,9 +1,11 @@
 package iptables
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"syscall"
 
 	"github.com/google/nftables"
@@ -16,50 +18,37 @@ const (
 	preroutingChain = "prerouting"
 	outputChain     = "output"
 
-	// fwmark value used to mark packets that should bypass the proxy
-	// Packets from proxy process are marked with this to prevent loops
-	fwMark       = 0x1
+	// FWMark is used to mark packets that should be handled by policy routing
+	FWMark = 0x1
+	// BypassMark is used to mark packets that should bypass the proxy
+	BypassMark   = 0xff
 	routingTable = 100
 )
 
+// TProxyRule defines a traffic interception rule
+type TProxyRule struct {
+	Protocols string   // "tcp" or "udp"
+	Ports     []uint16 // Source port to intercept (0 for all ports)
+	DstPort   uint16   // Destination port on local machine (proxy port)
+}
+
 // Manager manages nftables rules and policy routing for transparent proxying
 type Manager struct {
-	listenPort uint16
-	listenIP   net.IP
-	ports      []uint16 // Target ports to redirect (e.g., 80, 443)
-	proxyUID   uint32   // UID of proxy process (to exclude from redirection)
-	conn       *nftables.Conn
-	table      *nftables.Table
+	rules []TProxyRule
+	conn  *nftables.Conn
+	table *nftables.Table
 }
 
 // NewManager creates a new nftables manager
-func NewManager(listenPort int, targetPorts []int) *Manager {
-	ports := make([]uint16, len(targetPorts))
-	for i, p := range targetPorts {
-		ports[i] = uint16(p)
-	}
-
+func NewManager(rules []TProxyRule) *Manager {
 	return &Manager{
-		listenPort: uint16(listenPort),
-		listenIP:   net.IPv4(127, 0, 0, 1),
-		ports:      ports,
-		proxyUID:   uint32(syscall.Getuid()),
+		rules: rules,
 	}
 }
 
-// DefaultPorts returns the default ports to redirect (80 and 443)
-func DefaultPorts() []int {
-	return []int{80, 443}
-}
-
-// Setup configures nftables rules and policy routing to redirect traffic to the proxy
-// Uses fwmark + policy routing to prevent traffic loops
+// Setup configures nftables rules and policy routing to intercept traffic to the proxy
 func (m *Manager) Setup() error {
-	slog.Info("Setting up nftables rules",
-		"ports", m.ports,
-		"listenPort", m.listenPort,
-		"proxyUID", m.proxyUID,
-	)
+	slog.Info("Setting up nftables rules", "rules", m.rules)
 
 	// Create netlink connection
 	conn, err := nftables.New()
@@ -84,18 +73,35 @@ func (m *Manager) Setup() error {
 	m.table = m.conn.AddTable(table)
 
 	// Create OUTPUT chain (for locally generated traffic)
-	outputChain := &nftables.Chain{
+	outputCh := &nftables.Chain{
 		Name:     outputChain,
 		Table:    m.table,
-		Type:     nftables.ChainTypeNAT,
+		Type:     nftables.ChainTypeRoute,
 		Hooknum:  nftables.ChainHookOutput,
-		Priority: nftables.ChainPriorityNATDest,
+		Priority: nftables.ChainPriorityMangle,
 	}
-	m.conn.AddChain(outputChain)
+	m.conn.AddChain(outputCh)
 
-	// Add rules to OUTPUT chain
-	for _, port := range m.ports {
-		if err := m.addOutputRule(outputChain, port); err != nil {
+	// Create PREROUTING chain (for traffic from other devices)
+	preroutingCh := &nftables.Chain{
+		Name:     preroutingChain,
+		Table:    m.table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookPrerouting,
+		Priority: nftables.ChainPriorityMangle,
+	}
+	m.conn.AddChain(preroutingCh)
+
+	// Add bypass rule to OUTPUT chain
+	m.addBypassRule(outputCh)
+
+	// Add rules to both chains
+	for _, rule := range m.rules {
+		if err := m.addRule(outputCh, rule, true); err != nil {
+			m.Cleanup()
+			return err
+		}
+		if err := m.addRule(preroutingCh, rule, false); err != nil {
 			m.Cleanup()
 			return err
 		}
@@ -111,96 +117,166 @@ func (m *Manager) Setup() error {
 	return nil
 }
 
-// addOutputRule adds a redirect rule for OUTPUT chain
-// Excludes traffic from the proxy process (by UID) to prevent loops
-func (m *Manager) addOutputRule(chain *nftables.Chain, dstPort uint16) error {
-	rule := &nftables.Rule{
+// addBypassRule adds a rule to bypass proxy for its own traffic
+func (m *Manager) addBypassRule(chain *nftables.Chain) {
+	m.conn.AddRule(&nftables.Rule{
 		Table: m.table,
 		Chain: chain,
 		Exprs: []expr.Any{
-			// Check L4 protocol is TCP
 			&expr.Meta{
-				Key:      expr.MetaKeyL4PROTO,
+				Key:      expr.MetaKeyMARK,
 				Register: 1,
 			},
 			&expr.Cmp{
 				Op:       expr.CmpOpEq,
 				Register: 1,
-				Data:     []byte{6}, // TCP
+				Data:     binaryUint32(BypassMark),
 			},
-			// Exclude traffic from proxy UID (prevent loop)
-			&expr.Meta{
-				Key:      expr.MetaKeySKUID,
-				Register: 1,
-			},
-			&expr.Cmp{
-				Op:       expr.CmpOpNeq,
-				Register: 1,
-				Data:     binaryUint32(m.proxyUID),
-			},
-			// Check destination port
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseTransportHeader,
-				Offset:       2, // Destination port offset in TCP header
-				Len:          2,
-			},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     binaryPort(dstPort),
-			},
-			// Set mark (for policy routing of return traffic)
-			&expr.Immediate{
-				Register: 1,
-				Data:     binaryUint32(fwMark),
-			},
-			&expr.Meta{
-				Key:            expr.MetaKeyMARK,
-				SourceRegister: true,
-				Register:       1,
-			},
-			// Redirect to proxy port
-			&expr.Immediate{
-				Register: 1,
-				Data:     binaryPort(m.listenPort),
-			},
-			&expr.Redir{
-				RegisterProtoMin: 1,
-				RegisterProtoMax: 1,
+			&expr.Verdict{
+				Kind: expr.VerdictAccept,
 			},
 		},
+	})
+}
+
+// addRule adds a tproxy rule for a specific chain
+func (m *Manager) addRule(chain *nftables.Chain, r TProxyRule, isOutput bool) error {
+	if r.Protocols == "" {
+		return nil
 	}
 
-	m.conn.AddRule(rule)
+	// If no ports specified or contains 0, match all ports (represented by a single rule with port 0)
+	ports := r.Ports
+	if len(ports) == 0 || slices.Contains(ports, 0) {
+		ports = []uint16{0}
+	}
+
+	for _, port := range ports {
+		exprs := []expr.Any{}
+
+		// 1. Protocol matching
+		exprs = append(exprs, &expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1})
+		exprs = append(exprs, &expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     []byte{ternary(r.Protocols == "udp", byte(17), byte(6))},
+		})
+
+		// 2. Port matching (skip if port is 0)
+		if port != 0 {
+			exprs = append(exprs, &expr.Payload{
+				DestRegister: 1,
+				Base:         expr.PayloadBaseTransportHeader,
+				Offset:       2, // Destination port offset in TCP/UDP header
+				Len:          2,
+			})
+			exprs = append(exprs, &expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     binaryPort(port),
+			})
+		}
+
+		// 3. Set mark
+		exprs = append(exprs, &expr.Immediate{
+			Register: 1,
+			Data:     binaryUint32(FWMark),
+		}, &expr.Meta{
+			Key:            expr.MetaKeyMARK,
+			SourceRegister: true,
+			Register:       1,
+		})
+
+		// 4. TProxy or Mark
+		if isOutput {
+			exprs = append(exprs, &expr.Verdict{
+				Kind: expr.VerdictAccept,
+			})
+			m.conn.AddRule(&nftables.Rule{
+				Table: m.table,
+				Chain: chain,
+				Exprs: exprs,
+			})
+		} else {
+			// For PREROUTING, add two rules: one for IPv4 and one for IPv6
+
+			// IPv4 rule
+			exprs4 := append([]expr.Any{}, exprs...)
+			exprs4 = append(exprs4, &expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1})
+			exprs4 = append(exprs4, &expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     []byte{byte(nftables.TableFamilyIPv4)},
+			})
+			exprs4 = append(exprs4, &expr.Immediate{
+				Register: 1,
+				Data:     binaryPort(r.DstPort),
+			}, &expr.TProxy{
+				Family:      byte(nftables.TableFamilyIPv4),
+				TableFamily: byte(nftables.TableFamilyINet),
+				RegPort:     1,
+			}, &expr.Verdict{
+				Kind: expr.VerdictAccept,
+			})
+			m.conn.AddRule(&nftables.Rule{
+				Table: m.table,
+				Chain: chain,
+				Exprs: exprs4,
+			})
+
+			// IPv6 rule
+			exprs6 := append([]expr.Any{}, exprs...)
+			exprs6 = append(exprs6, &expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1})
+			exprs6 = append(exprs6, &expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     []byte{byte(nftables.TableFamilyIPv6)},
+			})
+			exprs6 = append(exprs6, &expr.Immediate{
+				Register: 1,
+				Data:     binaryPort(r.DstPort),
+			}, &expr.TProxy{
+				Family:      byte(nftables.TableFamilyIPv6),
+				TableFamily: byte(nftables.TableFamilyINet),
+				RegPort:     1,
+			}, &expr.Verdict{
+				Kind: expr.VerdictAccept,
+			})
+			m.conn.AddRule(&nftables.Rule{
+				Table: m.table,
+				Chain: chain,
+				Exprs: exprs6,
+			})
+		}
+	}
+
 	return nil
 }
 
 // setupPolicyRouting configures ip rule and routing table
-// Marked packets will be routed to local loopback
 func (m *Manager) setupPolicyRouting() error {
-	// Add IPv4 rule: fwmark 0x1 lookup table 100
+	// Add IPv4 rule: fwmark FWMark lookup table 100
 	rule4 := netlink.NewRule()
-	rule4.Mark = fwMark
+	rule4.Mark = FWMark
 	rule4.Table = routingTable
 	rule4.Priority = 100
 	rule4.Family = netlink.FAMILY_V4
 
 	if err := netlink.RuleAdd(rule4); err != nil {
-		if err.Error() != "file exists" {
+		if !errors.Is(err, syscall.EEXIST) {
 			return fmt.Errorf("failed to add ipv4 rule: %w", err)
 		}
 	}
 
-	// Add IPv6 rule: fwmark 0x1 lookup table 100
+	// Add IPv6 rule: fwmark FWMark lookup table 100
 	rule6 := netlink.NewRule()
-	rule6.Mark = fwMark
+	rule6.Mark = FWMark
 	rule6.Table = routingTable
 	rule6.Priority = 100
 	rule6.Family = netlink.FAMILY_V6
 
 	if err := netlink.RuleAdd(rule6); err != nil {
-		if err.Error() != "file exists" {
+		if !errors.Is(err, syscall.EEXIST) {
 			return fmt.Errorf("failed to add ipv6 rule: %w", err)
 		}
 	}
@@ -212,34 +288,40 @@ func (m *Manager) setupPolicyRouting() error {
 	}
 
 	// IPv4 route
+	_, defaultNet4, _ := net.ParseCIDR("0.0.0.0/0")
 	route4 := &netlink.Route{
 		LinkIndex: lo.Attrs().Index,
-		Gw:        net.IPv4(127, 0, 0, 1),
+		Type:      syscall.RTN_LOCAL,
+		Dst:       defaultNet4,
 		Table:     routingTable,
 		Family:    netlink.FAMILY_V4,
+		Scope:     netlink.SCOPE_HOST,
 	}
 
 	if err := netlink.RouteAdd(route4); err != nil {
-		if err.Error() != "file exists" {
+		if !errors.Is(err, syscall.EEXIST) {
 			return fmt.Errorf("failed to add ipv4 route: %w", err)
 		}
 	}
 
 	// IPv6 route
+	_, defaultNet6, _ := net.ParseCIDR("::/0")
 	route6 := &netlink.Route{
 		LinkIndex: lo.Attrs().Index,
-		Gw:        net.IPv6loopback,
+		Type:      syscall.RTN_LOCAL,
+		Dst:       defaultNet6,
 		Table:     routingTable,
 		Family:    netlink.FAMILY_V6,
+		Scope:     netlink.SCOPE_HOST,
 	}
 
 	if err := netlink.RouteAdd(route6); err != nil {
-		if err.Error() != "file exists" {
+		if !errors.Is(err, syscall.EEXIST) {
 			return fmt.Errorf("failed to add ipv6 route: %w", err)
 		}
 	}
 
-	slog.Debug("Policy routing configured", "mark", fmt.Sprintf("0x%x", fwMark), "table", routingTable)
+	slog.Debug("Policy routing configured", "mark", fmt.Sprintf("0x%x", FWMark), "table", routingTable)
 	return nil
 }
 
@@ -247,19 +329,23 @@ func (m *Manager) setupPolicyRouting() error {
 func (m *Manager) cleanupPolicyRouting() {
 	// Remove IPv4 rule
 	rule4 := netlink.NewRule()
-	rule4.Mark = fwMark
+	rule4.Mark = FWMark
 	rule4.Table = routingTable
 	rule4.Priority = 100
 	rule4.Family = netlink.FAMILY_V4
-	netlink.RuleDel(rule4)
+	if err := netlink.RuleDel(rule4); err != nil {
+		slog.Debug("Failed to delete IPv4 rule", "error", err)
+	}
 
 	// Remove IPv6 rule
 	rule6 := netlink.NewRule()
-	rule6.Mark = fwMark
+	rule6.Mark = FWMark
 	rule6.Table = routingTable
 	rule6.Priority = 100
 	rule6.Family = netlink.FAMILY_V6
-	netlink.RuleDel(rule6)
+	if err := netlink.RuleDel(rule6); err != nil {
+		slog.Debug("Failed to delete IPv6 rule", "error", err)
+	}
 
 	// Remove routes from table
 	lo, err := netlink.LinkByName("lo")
@@ -272,14 +358,18 @@ func (m *Manager) cleanupPolicyRouting() {
 		Table:     routingTable,
 		Family:    netlink.FAMILY_V4,
 	}
-	netlink.RouteDel(route4)
+	if err := netlink.RouteDel(route4); err != nil {
+		slog.Debug("Failed to delete IPv4 route", "error", err)
+	}
 
 	route6 := &netlink.Route{
 		LinkIndex: lo.Attrs().Index,
 		Table:     routingTable,
 		Family:    netlink.FAMILY_V6,
 	}
-	netlink.RouteDel(route6)
+	if err := netlink.RouteDel(route6); err != nil {
+		slog.Debug("Failed to delete IPv6 route", "error", err)
+	}
 }
 
 // binaryPort converts a port number to network byte order (big-endian)
@@ -362,10 +452,17 @@ func (m *Manager) Status() (string, error) {
 	}
 
 	// Show policy routing info
-	rules, _ := netlink.RuleList(netlink.FAMILY_V4)
-	result += "\nPolicy routing rules:\n"
-	for _, r := range rules {
-		if r.Mark == fwMark {
+	rules4, _ := netlink.RuleList(netlink.FAMILY_V4)
+	rules6, _ := netlink.RuleList(netlink.FAMILY_V6)
+	result += "\nPolicy routing rules (IPv4):\n"
+	for _, r := range rules4 {
+		if r.Mark == FWMark {
+			result += fmt.Sprintf("  - mark 0x%x -> table %d\n", r.Mark, r.Table)
+		}
+	}
+	result += "\nPolicy routing rules (IPv6):\n"
+	for _, r := range rules6 {
+		if r.Mark == FWMark {
 			result += fmt.Sprintf("  - mark 0x%x -> table %d\n", r.Mark, r.Table)
 		}
 	}
@@ -405,4 +502,11 @@ func CheckAvailable() error {
 
 	slog.Debug("nftables is available")
 	return nil
+}
+
+func ternary[T any](cond bool, a, b T) T {
+	if cond {
+		return a
+	}
+	return b
 }

@@ -94,6 +94,12 @@ test:
 	@echo "Running tests..."
 	go test -v ./...
 
+# Run E2E tests (requires root)
+test-e2e: build
+	@echo "Running E2E tests (requires root)..."
+	@echo "NOTE: Tests will be skipped if not running as root"
+	sudo go test -v -tags=e2e ./e2e/...
+
 # Run linter
 lint:
 	@echo "Running linter..."
@@ -111,6 +117,7 @@ help:
 	@echo "  systemd-uninstall- Remove systemd service"
 	@echo "  cleanup          - Remove nftables rules"
 	@echo "  run              - Build and run locally (dev)"
-	@echo "  test             - Run tests"
+	@echo "  test             - Run unit tests"
+	@echo "  test-e2e         - Run E2E tests (requires root)"
 	@echo "  lint             - Run linter"
 	@echo "  help             - Show this help"

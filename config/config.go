@@ -25,6 +25,9 @@ type Config struct {
 	// Upstream proxy URL (http:// or socks5://)
 	Upstream string `yaml:"upstream"`
 
+	// DNS configuration
+	DNS DNSConfig `yaml:"dns"`
+
 	// Clash-compatible rules
 	Rules []string `yaml:"rules"`
 
@@ -33,6 +36,18 @@ type Config struct {
 
 	// Parsed upstream URL
 	UpstreamURL *url.URL `yaml:"-"`
+}
+
+// DNSConfig represents DNS proxy configuration
+type DNSConfig struct {
+	// Remote DNS servers (forwarded via upstream proxy)
+	Nameservers []string `yaml:"nameservers"`
+
+	// Local DNS servers (forwarded directly)
+	LocalNameservers []string `yaml:"local_nameservers"`
+
+	// Custom DNS rules (e.g., ["suffix:lan,DIRECT", "prefix:dev-,DIRECT"])
+	Rules []string `yaml:"rules"`
 }
 
 // Load reads and parses a configuration file
@@ -60,19 +75,18 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("listen address is required")
 	}
 
-	if c.Upstream == "" {
-		return fmt.Errorf("upstream proxy URL is required")
+	if c.Upstream != "" {
+		u, err := url.Parse(c.Upstream)
+		if err != nil {
+			return fmt.Errorf("invalid upstream URL: %w", err)
+		}
+
+		if u.Scheme != "http" && u.Scheme != "socks5" {
+			return fmt.Errorf("upstream must be http:// or socks5://, got %s", u.Scheme)
+		}
+
+		c.UpstreamURL = u
 	}
 
-	u, err := url.Parse(c.Upstream)
-	if err != nil {
-		return fmt.Errorf("invalid upstream URL: %w", err)
-	}
-
-	if u.Scheme != "http" && u.Scheme != "socks5" {
-		return fmt.Errorf("upstream must be http:// or socks5://, got %s", u.Scheme)
-	}
-
-	c.UpstreamURL = u
 	return nil
 }

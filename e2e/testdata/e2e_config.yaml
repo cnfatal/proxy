@@ -1,0 +1,29 @@
+# E2E Test Configuration
+# This is used for testing purposes only
+
+listen: ":12345"
+log_level: "debug"
+
+dns:
+  nameservers:
+    - "8.8.8.8"
+  local_nameservers:
+    - "8.8.8.8"
+
+rules:
+  # Test exact domain match
+  - DOMAIN,example.com,DIRECT
+
+  # Test domain suffix match
+  - DOMAIN-SUFFIX,google.com,DIRECT
+
+  # Test domain keyword match
+  - DOMAIN-KEYWORD,facebook,REJECT
+
+  # Test IP CIDR match
+  - IP-CIDR,127.0.0.0/8,DIRECT
+  - IP-CIDR,10.0.0.0/8,DIRECT
+  - IP-CIDR,192.168.0.0/16,DIRECT
+
+  # Default policy
+  - MATCH,DIRECT

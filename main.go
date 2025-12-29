@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"os"
@@ -72,6 +73,9 @@ func main() {
 	// Create rule matcher
 	matcher := rules.NewMatcher(parsedRules)
 
+	// Create buffer pool
+	pool := proxy.NewBufferPool()
+
 	// Get listen port
 	port, err := proxy.GetListenPort(cfg.Listen)
 	if err != nil {
@@ -85,13 +89,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	slog.Info("Running as", "uid", os.Getuid())
+
 	if err := iptables.CheckAvailable(); err != nil {
 		slog.Error("nftables check failed", "error", err)
 		os.Exit(1)
 	}
 
-	// Setup iptables
-	iptMgr := iptables.NewManager(port, iptables.DefaultPorts())
+	// Setup nftables
+	// We intercept both TCP and UDP traffic to the proxy port
+	rules := []iptables.TProxyRule{
+		{Protocols: "tcp", Ports: []uint16{80, 443}, DstPort: uint16(port)},
+	}
+
+	iptMgr := iptables.NewManager(rules)
 	if err := iptMgr.Setup(); err != nil {
 		slog.Error("Failed to setup nftables", "error", err)
 		os.Exit(1)
@@ -104,8 +115,8 @@ func main() {
 	}
 
 	// Setup signal handling for cleanup
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	// Cleanup on exit
 	defer func() {
@@ -113,26 +124,13 @@ func main() {
 		iptMgr.Cleanup()
 	}()
 
-	// Create buffer pool
-	pool := proxy.NewBufferPool()
-
 	// Create and start transparent proxy
 	tp := proxy.NewTransparentProxy(cfg, matcher, pool)
 
-	// Start proxy in goroutine
-	go func() {
-		if err := tp.Start(); err != nil {
-			slog.Error("Proxy error", "error", err)
-			sigChan <- syscall.SIGTERM
-		}
-	}()
-
-	// Wait for shutdown signal
-	sig := <-sigChan
-	slog.Info("Received signal", "signal", sig)
-
-	// Stop the proxy
-	tp.Stop()
+	// Run proxy (blocks until signal or error)
+	if err := tp.Run(ctx); err != nil {
+		slog.Error("Proxy error", "error", err)
+	}
 }
 
 func cleanupAndExit() {
@@ -141,8 +139,8 @@ func cleanupAndExit() {
 		os.Exit(1)
 	}
 
-	// Create manager just for cleanup (port doesn't matter)
-	iptMgr := iptables.NewManager(0, nil)
+	// Create manager just for cleanup (rules don't matter)
+	iptMgr := iptables.NewManager(nil)
 	iptMgr.Cleanup()
 	slog.Info("Cleanup completed")
 }

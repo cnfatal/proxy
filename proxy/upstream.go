@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -9,9 +10,23 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
 
+	"github.com/cnfatal/proxy/iptables"
 	"golang.org/x/net/proxy"
 )
+
+func bypassControl(network, address string, c syscall.RawConn) error {
+	return c.Control(func(fd uintptr) {
+		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, iptables.BypassMark)
+	})
+}
+
+func newBypassDialer() *net.Dialer {
+	return &net.Dialer{
+		Control: bypassControl,
+	}
+}
 
 // Upstream handles connections to upstream proxy servers
 type Upstream struct {
@@ -25,26 +40,27 @@ func NewUpstream(proxyURL *url.URL) *Upstream {
 
 // Connect establishes a connection to the target through the upstream proxy
 // Returns a net.Conn that can be used to communicate with the target
-func (u *Upstream) Connect(targetAddr string) (net.Conn, error) {
+func (u *Upstream) Connect(ctx context.Context, targetAddr string) (net.Conn, error) {
 	switch u.url.Scheme {
 	case "http":
-		return u.connectHTTP(targetAddr)
+		return u.connectHTTP(ctx, targetAddr)
 	case "socks5":
-		return u.connectSOCKS5(targetAddr)
+		return u.connectSOCKS5(ctx, targetAddr)
 	default:
 		return nil, fmt.Errorf("unsupported proxy scheme: %s", u.url.Scheme)
 	}
 }
 
 // connectHTTP establishes a tunnel through an HTTP proxy using CONNECT
-func (u *Upstream) connectHTTP(targetAddr string) (net.Conn, error) {
+func (u *Upstream) connectHTTP(ctx context.Context, targetAddr string) (net.Conn, error) {
 	proxyAddr := u.url.Host
 	if u.url.Port() == "" {
 		proxyAddr = net.JoinHostPort(u.url.Hostname(), "8080")
 	}
 
 	// Connect to the HTTP proxy
-	conn, err := net.Dial("tcp", proxyAddr)
+	dialer := newBypassDialer()
+	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to HTTP proxy: %w", err)
 	}
@@ -53,12 +69,12 @@ func (u *Upstream) connectHTTP(targetAddr string) (net.Conn, error) {
 	}
 
 	// Send CONNECT request
-	req := &http.Request{
+	req := (&http.Request{
 		Method: "CONNECT",
 		URL:    &url.URL{Opaque: targetAddr},
 		Host:   targetAddr,
 		Header: make(http.Header),
-	}
+	}).WithContext(ctx)
 
 	// Add proxy authentication if present
 	if u.url.User != nil {
@@ -92,7 +108,7 @@ func (u *Upstream) connectHTTP(targetAddr string) (net.Conn, error) {
 }
 
 // connectSOCKS5 establishes a connection through a SOCKS5 proxy
-func (u *Upstream) connectSOCKS5(targetAddr string) (net.Conn, error) {
+func (u *Upstream) connectSOCKS5(ctx context.Context, targetAddr string) (net.Conn, error) {
 	proxyAddr := u.url.Host
 	if u.url.Port() == "" {
 		proxyAddr = net.JoinHostPort(u.url.Hostname(), "1080")
@@ -107,12 +123,20 @@ func (u *Upstream) connectSOCKS5(targetAddr string) (net.Conn, error) {
 		}
 	}
 
-	dialer, err := proxy.SOCKS5("tcp", proxyAddr, auth, proxy.Direct)
+	dialer := newBypassDialer()
+
+	socks5Dialer, err := proxy.SOCKS5("tcp", proxyAddr, auth, dialer)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create SOCKS5 dialer: %w", err)
 	}
 
-	conn, err := dialer.Dial("tcp", targetAddr)
+	var conn net.Conn
+	if cd, ok := socks5Dialer.(proxy.ContextDialer); ok {
+		conn, err = cd.DialContext(ctx, "tcp", targetAddr)
+	} else {
+		conn, err = socks5Dialer.Dial("tcp", targetAddr)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect through SOCKS5: %w", err)
 	}
@@ -141,8 +165,9 @@ func (c *bufferedConn) CloseWrite() error {
 }
 
 // DirectConnect establishes a direct connection to the target
-func DirectConnect(targetAddr string) (net.Conn, error) {
-	conn, err := net.Dial("tcp", targetAddr)
+func DirectConnect(ctx context.Context, targetAddr string) (net.Conn, error) {
+	dialer := newBypassDialer()
+	conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect directly: %w", err)
 	}
