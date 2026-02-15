@@ -91,16 +91,6 @@ func (tp *TransparentProxy) handleConnection(clientConn *net.TCPConn) {
 	domain := ""
 	ip := origDst.IP
 
-	// Try reverse DNS lookup
-	names, err := net.LookupAddr(ip.String())
-	if err == nil && len(names) > 0 {
-		domain = names[0]
-		// Remove trailing dot
-		if len(domain) > 0 && domain[len(domain)-1] == '.' {
-			domain = domain[:len(domain)-1]
-		}
-	}
-
 	// Match against rules
 	result := tp.matcher.Match(domain, ip)
 
@@ -139,28 +129,33 @@ func (tp *TransparentProxy) handleConnection(clientConn *net.TCPConn) {
 
 // getOriginalDst retrieves the original destination address from a redirected connection
 func getOriginalDst(conn *net.TCPConn) (*net.TCPAddr, error) {
-	// Get the underlying file descriptor
-	file, err := conn.File()
+	rawConn, err := conn.SyscallConn()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get file descriptor: %w", err)
-	}
-	defer file.Close()
-
-	fd := int(file.Fd())
-
-	// Try IPv4 first
-	addr, err := getOriginalDstIPv4(fd)
-	if err == nil {
-		return addr, nil
+		return nil, fmt.Errorf("failed to get syscall conn: %w", err)
 	}
 
-	// Try IPv6
-	addr, err = getOriginalDstIPv6(fd)
-	if err == nil {
-		return addr, nil
+	var addr *net.TCPAddr
+	var lastErr error
+	err = rawConn.Control(func(fd uintptr) {
+		// Try IPv4 first
+		addr, lastErr = getOriginalDstIPv4(int(fd))
+		if lastErr == nil {
+			return
+		}
+
+		// Try IPv6
+		addr, lastErr = getOriginalDstIPv6(int(fd))
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("control failed: %w", err)
 	}
 
-	return nil, fmt.Errorf("failed to get original destination for both IPv4 and IPv6")
+	if lastErr != nil {
+		return nil, fmt.Errorf("failed to get original destination: %w", lastErr)
+	}
+
+	return addr, nil
 }
 
 // sockaddr_in represents the C sockaddr_in structure

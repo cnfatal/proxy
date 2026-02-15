@@ -7,8 +7,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 
 	"golang.org/x/net/proxy"
+)
+
+const (
+	// ConnectTimeout is the timeout for establishing a connection
+	ConnectTimeout = 10 * time.Second
 )
 
 // Upstream handles connections to upstream proxy servers
@@ -42,7 +48,7 @@ func (u *Upstream) connectHTTP(targetAddr string) (net.Conn, error) {
 	}
 
 	// Connect to the HTTP proxy
-	conn, err := net.Dial("tcp", proxyAddr)
+	conn, err := net.DialTimeout("tcp", proxyAddr, ConnectTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to HTTP proxy: %w", err)
 	}
@@ -102,7 +108,8 @@ func (u *Upstream) connectSOCKS5(targetAddr string) (net.Conn, error) {
 		}
 	}
 
-	dialer, err := proxy.SOCKS5("tcp", proxyAddr, auth, proxy.Direct)
+	baseDialer := &net.Dialer{Timeout: ConnectTimeout}
+	dialer, err := proxy.SOCKS5("tcp", proxyAddr, auth, baseDialer)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create SOCKS5 dialer: %w", err)
 	}
@@ -127,7 +134,7 @@ func (c *bufferedConn) Read(b []byte) (int, error) {
 
 // DirectConnect establishes a direct connection to the target
 func DirectConnect(targetAddr string) (net.Conn, error) {
-	conn, err := net.Dial("tcp", targetAddr)
+	conn, err := net.DialTimeout("tcp", targetAddr, ConnectTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect directly: %w", err)
 	}
