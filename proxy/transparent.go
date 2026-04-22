@@ -220,6 +220,19 @@ func (tp *TransparentProxy) getOriginalUDPAddr(oob []byte) *net.UDPAddr {
 }
 
 func (tp *TransparentProxy) handleGeneralUDP(ctx context.Context, srcAddr net.Addr, origDst *net.UDPAddr, data []byte) {
+	result := tp.matcher.Match("", origDst.IP)
+	switch result.Policy {
+	case config.PolicyReject:
+		slog.Info("Rejecting UDP connection", "target", origDst.String(), "ip", origDst.IP)
+		return
+	case config.PolicyProxy:
+		slog.Warn("UDP proxy is not supported, dropping packet", "target", origDst.String(), "ip", origDst.IP, "port", origDst.Port, "upstream", tp.upstreamScheme())
+		if origDst.Port == 443 {
+			slog.Info("Dropping UDP/443 traffic because transparent UDP proxying is unsupported", "target", origDst.String(), "ip", origDst.IP)
+		}
+		return
+	}
+
 	key := fmt.Sprintf("%s-%s", srcAddr.String(), origDst.String())
 
 	tp.udpMu.Lock()
@@ -267,6 +280,13 @@ func (tp *TransparentProxy) handleGeneralUDP(ctx context.Context, srcAddr net.Ad
 	}
 
 	_, _ = session.remoteConn.WriteTo(data, origDst)
+}
+
+func (tp *TransparentProxy) upstreamScheme() string {
+	if tp.upstream == nil || tp.upstream.url == nil {
+		return ""
+	}
+	return tp.upstream.url.Scheme
 }
 
 func (tp *TransparentProxy) cleanupUDPSessions(ctx context.Context) {
@@ -361,8 +381,9 @@ func (tp *TransparentProxy) handleConnection(ctx context.Context, client net.Con
 			slog.Warn("No upstream proxy configured, using direct connection")
 			serverConn, err = DirectConnect(ctx, targetAddr)
 		} else {
-			slog.Debug("Proxying connection", "target", targetAddr, "domain", domain, "policy", result.Policy)
-			serverConn, err = tp.upstream.Connect(ctx, targetAddr)
+			upstreamTargetAddr := buildUpstreamTargetAddr(domain, origDst)
+			slog.Debug("Proxying connection", "target", targetAddr, "upstream_target", upstreamTargetAddr, "domain", domain, "policy", result.Policy)
+			serverConn, err = tp.upstream.Connect(ctx, upstreamTargetAddr)
 		}
 	}
 
@@ -376,6 +397,13 @@ func (tp *TransparentProxy) handleConnection(ctx context.Context, client net.Con
 	Relay(serverConn, client, tp.pool)
 
 	slog.Debug("Relay completed", "target", targetAddr)
+}
+
+func buildUpstreamTargetAddr(domain string, origDst *net.TCPAddr) string {
+	if domain == "" {
+		return origDst.String()
+	}
+	return net.JoinHostPort(domain, strconv.Itoa(origDst.Port))
 }
 
 // GetListenPort extracts the port number from the listen address

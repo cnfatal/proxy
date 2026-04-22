@@ -1,11 +1,16 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -176,5 +181,114 @@ func TestUpstreamHTTP_Mock(t *testing.T) {
 	n, _ := conn.Read(buf)
 	if !strings.Contains(string(buf[:n]), "target response") {
 		t.Errorf("Response = %q, want 'target response'", string(buf[:n]))
+	}
+}
+
+func TestUpstreamHTTP_TLSConnectTunnel(t *testing.T) {
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+
+	var (
+		recordedHost string
+		mu           sync.Mutex
+	)
+
+	proxyListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxyListener.Close()
+
+	go func() {
+		for {
+			conn, err := proxyListener.Accept()
+			if err != nil {
+				return
+			}
+
+			go func(conn net.Conn) {
+				defer conn.Close()
+
+				reader := bufio.NewReader(conn)
+				req, err := http.ReadRequest(reader)
+				if err != nil {
+					return
+				}
+
+				mu.Lock()
+				recordedHost = req.Host
+				mu.Unlock()
+
+				targetConn, err := net.Dial("tcp", req.Host)
+				if err != nil {
+					conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+					return
+				}
+				defer targetConn.Close()
+
+				conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+				copyDone := make(chan struct{}, 2)
+				go func() {
+					io.Copy(targetConn, reader)
+					if cw, ok := targetConn.(interface{ CloseWrite() error }); ok {
+						_ = cw.CloseWrite()
+					}
+					copyDone <- struct{}{}
+				}()
+				go func() {
+					io.Copy(conn, targetConn)
+					if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+						_ = cw.CloseWrite()
+					}
+					copyDone <- struct{}{}
+				}()
+				<-copyDone
+				<-copyDone
+			}(conn)
+		}
+	}()
+
+	proxyURL, _ := url.Parse("http://" + proxyListener.Addr().String())
+	upstream := NewUpstream(proxyURL)
+
+	conn, err := upstream.Connect(context.Background(), target.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Connect error = %v", err)
+	}
+	defer conn.Close()
+
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	defer tlsConn.Close()
+
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("TLS handshake through proxy failed: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "https://"+target.Listener.Addr().String()+"/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := req.Write(tlsConn); err != nil {
+		t.Fatalf("Failed to write HTTP request over tunnel: %v", err)
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(tlsConn), req)
+	if err != nil {
+		t.Fatalf("Failed to read HTTP response over tunnel: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	mu.Lock()
+	gotHost := recordedHost
+	mu.Unlock()
+	if gotHost != target.Listener.Addr().String() {
+		t.Fatalf("CONNECT host = %q, want %q", gotHost, target.Listener.Addr().String())
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"time"
 )
@@ -89,25 +90,62 @@ func (s *domainSniffer) Sniff(conn net.Conn) (string, []byte, error) {
 		switch {
 		case peeked[0] == 0x16:
 			if domain, done := sniffSNI(peeked); done {
+				s.logSniffResult(conn, "tls", total, domain, "", nil)
 				return domain, peeked, nil
 			}
 		case isLikelyHTTP(peeked):
 			if domain, done := sniffHTTP(peeked); done {
+				s.logSniffResult(conn, "http", total, domain, "", nil)
 				return domain, peeked, nil
 			}
 		default:
+			s.logSniffResult(conn, "unknown", total, "", "unrecognized initial bytes", nil)
 			return "", peeked, nil
 		}
 
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				s.logSniffResult(conn, sniffProtocol(peeked), total, "", "reached EOF before complete sniff", nil)
 				return "", peeked, nil
 			}
+			s.logSniffResult(conn, sniffProtocol(peeked), total, "", "", err)
 			return "", peeked, err
 		}
 	}
 
+	s.logSniffResult(conn, sniffProtocol(buf[:total]), total, "", "sniff buffer exhausted before complete parse", nil)
 	return "", buf[:total], nil
+}
+
+func (s *domainSniffer) logSniffResult(conn net.Conn, protocol string, peekedLen int, domain, reason string, err error) {
+	attrs := []any{
+		"remote", conn.RemoteAddr(),
+		"peeked_bytes", peekedLen,
+		"protocol", protocol,
+	}
+	if domain != "" {
+		attrs = append(attrs, "domain", domain)
+	}
+	if reason != "" {
+		attrs = append(attrs, "reason", reason)
+	}
+	if err != nil {
+		attrs = append(attrs, "error", err)
+	}
+	slog.Debug("Sniff result", attrs...)
+}
+
+func sniffProtocol(data []byte) string {
+	if len(data) == 0 {
+		return "empty"
+	}
+	if data[0] == 0x16 {
+		return "tls"
+	}
+	if isLikelyHTTP(data) {
+		return "http"
+	}
+	return "unknown"
 }
 
 func sniffSNI(data []byte) (string, bool) {

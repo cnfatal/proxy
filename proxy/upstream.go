@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -179,32 +180,53 @@ func DirectConnect(ctx context.Context, targetAddr string) (net.Conn, error) {
 
 // Relay copies data bidirectionally between two connections
 func Relay(dst, src net.Conn, pool BufferPool) {
-	copy := func(to, from net.Conn, done chan struct{}) {
+	copy := func(direction string, to, from net.Conn, done chan<- struct{}) {
+		var copied int64
+		var err error
 		defer func() { done <- struct{}{} }()
 
 		buf := pool.Get()
 		defer pool.Put(buf)
 
-		_, err := io.CopyBuffer(to, from, buf)
-		if err != nil && err != io.EOF {
-			// Only log if it's not a normal closure
-			if !isClosedError(err) {
-				slog.Debug("Relay error", "from", from.RemoteAddr(), "to", to.RemoteAddr(), "error", err)
-			}
-		}
+		copied, err = io.CopyBuffer(to, from, buf)
+		logRelayResult(direction, from, to, copied, err)
 
 		if cw, ok := to.(interface{ CloseWrite() error }); ok {
-			cw.CloseWrite()
+			if closeErr := cw.CloseWrite(); closeErr != nil && !isClosedError(closeErr) {
+				slog.Debug("Relay close-write error", "direction", direction, "to", to.RemoteAddr(), "error", closeErr)
+			}
 		}
 	}
 
 	done := make(chan struct{}, 2)
-	go copy(dst, src, done)
-	go copy(src, dst, done)
+	go copy("client->server", dst, src, done)
+	go copy("server->client", src, dst, done)
 
 	// Wait for both directions to complete
 	<-done
 	<-done
+}
+
+func logRelayResult(direction string, from, to net.Conn, copied int64, err error) {
+	attrs := []any{
+		"direction", direction,
+		"from", from.RemoteAddr(),
+		"to", to.RemoteAddr(),
+		"bytes", copied,
+	}
+
+	switch {
+	case err == nil:
+		slog.Debug("Relay completed", attrs...)
+	case errors.Is(err, io.EOF):
+		slog.Debug("Relay reached EOF", attrs...)
+	case isClosedError(err):
+		attrs = append(attrs, "error", err)
+		slog.Debug("Relay closed", attrs...)
+	default:
+		attrs = append(attrs, "error", err)
+		slog.Debug("Relay error", attrs...)
+	}
 }
 
 func isClosedError(err error) bool {
