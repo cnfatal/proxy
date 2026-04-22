@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"time"
@@ -70,80 +71,108 @@ func (s *domainSniffer) Sniff(conn net.Conn) (string, []byte, error) {
 	}
 
 	buf := s.pool.GetSmall()
-	n, err := conn.Read(buf[:SmallBufferSize])
-	if n <= 0 {
-		s.pool.Put(buf)
-		return "", nil, err
-	}
-	peeked := buf[:n]
+	total := 0
 
-	if peeked[0] == 0x16 {
-		// TLS
-		return sniffSNI(peeked), peeked, nil
-	} else if isLikelyHTTP(peeked) {
-		// HTTP
-		return sniffHTTP(peeked), peeked, nil
+	for total < SmallBufferSize {
+		n, err := conn.Read(buf[total:SmallBufferSize])
+		total += n
+
+		if total <= 0 {
+			if err != nil {
+				s.pool.Put(buf)
+				return "", nil, err
+			}
+			continue
+		}
+
+		peeked := buf[:total]
+		switch {
+		case peeked[0] == 0x16:
+			if domain, done := sniffSNI(peeked); done {
+				return domain, peeked, nil
+			}
+		case isLikelyHTTP(peeked):
+			if domain, done := sniffHTTP(peeked); done {
+				return domain, peeked, nil
+			}
+		default:
+			return "", peeked, nil
+		}
+
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return "", peeked, nil
+			}
+			return "", peeked, err
+		}
 	}
 
-	return "", peeked, nil
+	return "", buf[:total], nil
 }
 
-func sniffSNI(data []byte) string {
-	if len(data) < 5 || data[0] != 0x16 {
-		return ""
+func sniffSNI(data []byte) (string, bool) {
+	if len(data) < 5 {
+		return "", false
+	}
+	if data[0] != 0x16 {
+		return "", true
 	}
 
-	// Skip record header (5 bytes)
-	data = data[5:]
+	recordLen := int(data[3])<<8 | int(data[4])
+	if len(data) < 5+recordLen {
+		return "", false
+	}
+	data = data[5 : 5+recordLen]
+
 	if len(data) < 4 || data[0] != 0x01 { // Handshake Type: Client Hello (1)
-		return ""
+		return "", true
 	}
 
 	// Skip handshake header (4 bytes)
 	data = data[4:]
 	if len(data) < 34 { // Version (2) + Random (32)
-		return ""
+		return "", true
 	}
 	data = data[34:]
 
 	// Session ID
 	if len(data) < 1 {
-		return ""
+		return "", true
 	}
 	sessionIDLen := int(data[0])
 	if len(data) < 1+sessionIDLen {
-		return ""
+		return "", true
 	}
 	data = data[1+sessionIDLen:]
 
 	// Cipher Suites
 	if len(data) < 2 {
-		return ""
+		return "", true
 	}
 	cipherSuiteLen := int(data[0])<<8 | int(data[1])
 	if len(data) < 2+cipherSuiteLen {
-		return ""
+		return "", true
 	}
 	data = data[2+cipherSuiteLen:]
 
 	// Compression Methods
 	if len(data) < 1 {
-		return ""
+		return "", true
 	}
 	compressionMethodLen := int(data[0])
 	if len(data) < 1+compressionMethodLen {
-		return ""
+		return "", true
 	}
 	data = data[1+compressionMethodLen:]
 
 	// Extensions
 	if len(data) < 2 {
-		return ""
+		return "", true
 	}
 	extensionsLen := int(data[0])<<8 | int(data[1])
 	data = data[2:]
 	if len(data) < extensionsLen {
-		return ""
+		return "", true
 	}
 
 	for len(data) >= 4 {
@@ -157,22 +186,22 @@ func sniffSNI(data []byte) string {
 		if extType == 0x00 { // Server Name Extension
 			snData := data[:extLen]
 			if len(snData) < 2 {
-				break
+				return "", true
 			}
 			snListLen := int(snData[0])<<8 | int(snData[1])
 			snData = snData[2:]
 			if len(snData) < snListLen {
-				break
+				return "", true
 			}
 			for len(snData) >= 3 {
 				nameType := snData[0]
 				nameLen := int(snData[1])<<8 | int(snData[2])
 				snData = snData[3:]
 				if len(snData) < nameLen {
-					break
+					return "", true
 				}
 				if nameType == 0x00 { // Host Name
-					return string(snData[:nameLen])
+					return string(snData[:nameLen]), true
 				}
 				snData = snData[nameLen:]
 			}
@@ -180,7 +209,7 @@ func sniffSNI(data []byte) string {
 		data = data[extLen:]
 	}
 
-	return ""
+	return "", true
 }
 
 func isLikelyHTTP(data []byte) bool {
@@ -195,21 +224,25 @@ func isLikelyHTTP(data []byte) bool {
 	return false
 }
 
-func sniffHTTP(data []byte) string {
+func sniffHTTP(data []byte) (string, bool) {
+	if !bytes.Contains(data, []byte("\r\n\r\n")) && !bytes.Contains(data, []byte("\n\n")) {
+		return "", false
+	}
+
 	// Find the end of the first line
 	idx := bytes.IndexByte(data, '\n')
 	if idx == -1 {
-		return ""
+		return "", false
 	}
 	firstLine := data[:idx]
 
 	// Check if it looks like an HTTP request: METHOD PATH HTTP/1.x
 	parts := bytes.Split(firstLine, []byte(" "))
 	if len(parts) < 3 {
-		return ""
+		return "", true
 	}
 	if !bytes.HasPrefix(parts[len(parts)-1], []byte("HTTP/")) {
-		return ""
+		return "", true
 	}
 
 	// Look for Host header in subsequent lines
@@ -235,11 +268,11 @@ func sniffHTTP(data []byte) string {
 			// Remove port if present
 			hostStr := string(host)
 			if h, _, err := net.SplitHostPort(hostStr); err == nil {
-				return h
+				return h, true
 			}
-			return hostStr
+			return hostStr, true
 		}
 	}
 
-	return ""
+	return "", true
 }

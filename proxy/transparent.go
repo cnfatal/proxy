@@ -293,7 +293,9 @@ func (tp *TransparentProxy) cleanupUDPSessions(ctx context.Context) {
 
 // handleConnection handles a single incoming connection
 func (tp *TransparentProxy) handleConnection(ctx context.Context, client net.Conn) {
-	defer client.Close()
+	defer func() {
+		client.Close()
+	}()
 
 	// Set TCP_NODELAY to reduce latency
 	if tcpConn, ok := client.(*net.TCPConn); ok {

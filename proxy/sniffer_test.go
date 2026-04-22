@@ -37,7 +37,10 @@ func TestSniffHTTP(t *testing.T) {
 			var buf bytes.Buffer
 			req.Write(&buf)
 
-			domain := sniffHTTP(buf.Bytes())
+			domain, done := sniffHTTP(buf.Bytes())
+			if !done {
+				t.Fatal("Expected complete HTTP sniff")
+			}
 			if domain != tt.expected {
 				t.Errorf("Expected '%s', got '%s'", tt.expected, domain)
 			}
@@ -47,14 +50,20 @@ func TestSniffHTTP(t *testing.T) {
 	// Test cases for invalid/missing data
 	t.Run("No Host header", func(t *testing.T) {
 		data := []byte("GET / HTTP/1.1\nUser-Agent: curl/7.68.0\n\n")
-		domain := sniffHTTP(data)
+		domain, done := sniffHTTP(data)
+		if !done {
+			t.Fatal("Expected complete HTTP sniff")
+		}
 		if domain != "" {
 			t.Errorf("Expected empty string, got '%s'", domain)
 		}
 	})
 
 	t.Run("Invalid HTTP", func(t *testing.T) {
-		domain := sniffHTTP([]byte("NOT A REQUEST"))
+		domain, done := sniffHTTP([]byte("NOT A REQUEST\n\n"))
+		if !done {
+			t.Fatal("Expected complete HTTP sniff")
+		}
 		if domain != "" {
 			t.Errorf("Expected empty string, got '%s'", domain)
 		}
@@ -94,7 +103,10 @@ func TestSniffSNI(t *testing.T) {
 				t.Fatalf("Failed to read ClientHello: %v", err)
 			}
 
-			domain := sniffSNI(buf[:n])
+			domain, done := sniffSNI(buf[:n])
+			if !done {
+				t.Fatal("Expected complete TLS sniff")
+			}
 			if domain != tt.server {
 				t.Errorf("Expected '%s', got '%s'", tt.server, domain)
 			}
@@ -213,4 +225,49 @@ func TestSniffDomain(t *testing.T) {
 			t.Errorf("Peeked data size %d exceeds SmallBufferSize %d", len(peeked), SmallBufferSize)
 		}
 	})
+
+	t.Run("TLS SNI Fragmented ClientHello", func(t *testing.T) {
+		hello := captureClientHello(t, "fragmented.example")
+
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+
+		go func() {
+			c1.Write(hello[:16])
+			time.Sleep(10 * time.Millisecond)
+			c1.Write(hello[16:])
+		}()
+
+		domain, peeked, err := sniffer.Sniff(c2)
+		if err != nil {
+			t.Fatalf("Sniff failed: %v", err)
+		}
+		if domain != "fragmented.example" {
+			t.Fatalf("Expected fragmented.example, got %s", domain)
+		}
+		if !bytes.Equal(peeked, hello) {
+			t.Fatal("Expected peeked data to preserve the full ClientHello")
+		}
+	})
+}
+
+func captureClientHello(t *testing.T, serverName string) []byte {
+	t.Helper()
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	go func() {
+		_ = tls.Client(clientConn, &tls.Config{ServerName: serverName}).Handshake()
+	}()
+
+	buf := make([]byte, 4096)
+	n, err := serverConn.Read(buf)
+	if err != nil {
+		t.Fatalf("Failed to read ClientHello: %v", err)
+	}
+
+	return append([]byte(nil), buf[:n]...)
 }
