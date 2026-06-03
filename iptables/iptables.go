@@ -25,10 +25,26 @@ const (
 	routingTable = 100
 )
 
+var bypassDestinationCIDRs = []string{
+	"0.0.0.0/8",
+	"10.0.0.0/8",
+	"100.64.0.0/10",
+	"127.0.0.0/8",
+	"169.254.0.0/16",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"224.0.0.0/4",
+	"240.0.0.0/4",
+	"::1/128",
+	"fc00::/7",
+	"fe80::/10",
+	"ff00::/8",
+}
+
 // TProxyRule defines a traffic interception rule
 type TProxyRule struct {
 	Protocols string   // "tcp" or "udp"
-	Ports     []uint16 // Source port to intercept (0 for all ports)
+	Ports     []uint16 // Destination port to intercept (0 for all ports)
 	DstPort   uint16   // Destination port on local machine (proxy port)
 }
 
@@ -94,6 +110,14 @@ func (m *Manager) Setup() error {
 
 	// Add bypass rule to OUTPUT chain
 	m.addBypassRule(outputCh)
+	if err := m.addDestinationBypassRules(outputCh); err != nil {
+		m.Cleanup()
+		return err
+	}
+	if err := m.addDestinationBypassRules(preroutingCh); err != nil {
+		m.Cleanup()
+		return err
+	}
 
 	// Add rules to both chains
 	for _, rule := range m.rules {
@@ -137,6 +161,71 @@ func (m *Manager) addBypassRule(chain *nftables.Chain) {
 			},
 		},
 	})
+}
+
+func (m *Manager) addDestinationBypassRules(chain *nftables.Chain) error {
+	for _, cidr := range bypassDestinationCIDRs {
+		exprs, err := destinationCIDRExprs(cidr)
+		if err != nil {
+			return err
+		}
+		exprs = append(exprs, &expr.Verdict{
+			Kind: expr.VerdictAccept,
+		})
+		m.conn.AddRule(&nftables.Rule{
+			Table: m.table,
+			Chain: chain,
+			Exprs: exprs,
+		})
+	}
+	return nil
+}
+
+func destinationCIDRExprs(cidr string) ([]expr.Any, error) {
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid bypass cidr %q: %w", cidr, err)
+	}
+
+	family := byte(nftables.TableFamilyIPv6)
+	offset := uint32(24)
+	addr := network.IP.To16()
+	mask := []byte(network.Mask)
+	if ipv4 := network.IP.To4(); ipv4 != nil {
+		family = byte(nftables.TableFamilyIPv4)
+		offset = 16
+		addr = ipv4
+	}
+	if addr == nil {
+		return nil, fmt.Errorf("invalid bypass cidr %q", cidr)
+	}
+
+	return []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     []byte{family},
+		},
+		&expr.Payload{
+			DestRegister: 1,
+			Base:         expr.PayloadBaseNetworkHeader,
+			Offset:       offset,
+			Len:          uint32(len(addr)),
+		},
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            uint32(len(addr)),
+			Mask:           mask,
+			Xor:            make([]byte, len(addr)),
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     addr,
+		},
+	}, nil
 }
 
 // addRule adds a tproxy rule for a specific chain
