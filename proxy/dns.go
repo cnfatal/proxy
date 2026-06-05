@@ -159,6 +159,7 @@ func (tp *TransparentProxy) resolveDirect(ctx context.Context, w dns.ResponseWri
 
 	if reply != nil {
 		reply.Id = r.Id
+		tp.associateDNSReply(reply)
 		w.WriteMsg(reply)
 	}
 }
@@ -186,7 +187,26 @@ func (tp *TransparentProxy) resolveProxy(ctx context.Context, w dns.ResponseWrit
 
 	if reply != nil {
 		reply.Id = r.Id
+		tp.associateDNSReply(reply)
 		w.WriteMsg(reply)
+	}
+}
+
+// associateDNSReply extracts A/AAAA records from a DNS reply and registers the
+// IP→domain associations in the rule matcher so domain-based rules can match
+// subsequent traffic to those IPs.
+func (tp *TransparentProxy) associateDNSReply(reply *dns.Msg) {
+	if len(reply.Question) == 0 {
+		return
+	}
+	domain := strings.TrimSuffix(reply.Question[0].Name, ".")
+	for _, rr := range reply.Answer {
+		switch v := rr.(type) {
+		case *dns.A:
+			tp.matcher.AssociateDomain(v.A, domain)
+		case *dns.AAAA:
+			tp.matcher.AssociateDomain(v.AAAA, domain)
+		}
 	}
 }
 

@@ -19,6 +19,7 @@ type MockProxy struct {
 	listener    net.Listener
 	addr        string
 	connections int
+	targets     []string
 	mu          sync.Mutex
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -33,9 +34,14 @@ func NewMockProxy() *MockProxy {
 	}
 }
 
-// Start starts the mock proxy on a random port
+// Start starts the mock proxy bound to all interfaces (accessible from other network namespaces).
 func (p *MockProxy) Start() error {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	return p.StartAt("0.0.0.0:0")
+}
+
+// StartAt starts the mock proxy on a specific address.
+func (p *MockProxy) StartAt(addr string) error {
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
@@ -51,9 +57,18 @@ func (p *MockProxy) Addr() string {
 	return p.addr
 }
 
-// URL returns the proxy URL for configuration
+// URL returns the proxy URL for configuration using the given host IP.
+// Use this instead of Addr() when the proxy must be reached from a different
+// network namespace where 0.0.0.0 resolves differently.
+func (p *MockProxy) URLFor(hostIP string) string {
+	_, port, _ := net.SplitHostPort(p.addr)
+	return fmt.Sprintf("http://%s:%s", hostIP, port)
+}
+
+// URL returns the proxy URL (with 127.0.0.1 for same-host use)
 func (p *MockProxy) URL() string {
-	return fmt.Sprintf("http://%s", p.addr)
+	_, port, _ := net.SplitHostPort(p.addr)
+	return fmt.Sprintf("http://127.0.0.1:%s", port)
 }
 
 // ConnectionCount returns number of connections handled
@@ -61,6 +76,23 @@ func (p *MockProxy) ConnectionCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.connections
+}
+
+// AllTargets returns the CONNECT targets seen so far (host:port).
+func (p *MockProxy) AllTargets() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, len(p.targets))
+	copy(out, p.targets)
+	return out
+}
+
+// Reset clears connection counters and target history.
+func (p *MockProxy) Reset() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.connections = 0
+	p.targets = nil
 }
 
 // Stop stops the mock proxy
@@ -107,6 +139,10 @@ func (p *MockProxy) handleConnection(conn net.Conn) {
 }
 
 func (p *MockProxy) handleConnect(conn net.Conn, req *http.Request) {
+	p.mu.Lock()
+	p.targets = append(p.targets, req.Host)
+	p.mu.Unlock()
+
 	// Connect to target
 	targetConn, err := net.Dial("tcp", req.Host)
 	if err != nil {
@@ -157,11 +193,12 @@ type MockTargetServer struct {
 	addr     string
 	requests int
 	mu       sync.Mutex
+	response string
 }
 
 // NewMockTargetServer creates a new mock target server
 func NewMockTargetServer(response string) *MockTargetServer {
-	m := &MockTargetServer{}
+	m := &MockTargetServer{response: response}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -181,9 +218,14 @@ func NewMockTargetServer(response string) *MockTargetServer {
 	return m
 }
 
-// Start starts the mock target server
+// Start starts the mock target server bound to all interfaces.
 func (m *MockTargetServer) Start() error {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	return m.StartAt("0.0.0.0:0")
+}
+
+// StartAt starts the mock target server on the given address.
+func (m *MockTargetServer) StartAt(addr string) error {
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
@@ -199,21 +241,34 @@ func (m *MockTargetServer) Addr() string {
 	return m.addr
 }
 
-// URL returns the server URL
-func (m *MockTargetServer) URL() string {
-	return fmt.Sprintf("http://%s", m.addr)
+// Port returns just the port number.
+func (m *MockTargetServer) Port() string {
+	_, port, _ := net.SplitHostPort(m.addr)
+	return port
 }
 
-// RequestCount returns number of requests handled
+// URLFor returns the HTTP URL using the given host IP (use when accessed from another namespace).
+func (m *MockTargetServer) URLFor(hostIP string) string {
+	return fmt.Sprintf("http://%s:%s/", hostIP, m.Port())
+}
+
+// URL returns the local HTTP URL.
+func (m *MockTargetServer) URL() string {
+	return fmt.Sprintf("http://%s/", m.addr)
+}
+
+// RequestCount returns number of requests handled.
 func (m *MockTargetServer) RequestCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.requests
 }
 
-// Stop stops the mock target server
+// Stop stops the mock target server.
 func (m *MockTargetServer) Stop() {
 	if m.server != nil {
 		m.server.Close()
 	}
 }
+
+// NewMockProxy creates a new mock HTTP proxy server

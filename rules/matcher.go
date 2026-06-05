@@ -3,6 +3,7 @@ package rules
 import (
 	"net"
 	"strings"
+	"sync"
 
 	"github.com/cnfatal/proxy/config"
 )
@@ -16,6 +17,10 @@ type Matcher struct {
 	prefixRules  []prefixRule
 	matchRule    *Rule
 	matchIndex   int
+
+	// ipToDomain caches DNS-resolved IP→domain associations for rule matching.
+	ipToDomain   map[string]string
+	ipToDomainMu sync.RWMutex
 }
 
 type keywordRule struct {
@@ -35,6 +40,7 @@ func NewMatcher(rules []*Rule) *Matcher {
 		domainTrie: NewDomainTrie(),
 		ipTree:     NewIPTree(),
 		matchIndex: -1,
+		ipToDomain: make(map[string]string),
 	}
 
 	for i, rule := range rules {
@@ -64,10 +70,28 @@ type MatchResult struct {
 	Rule   *Rule
 }
 
+// AssociateDomain records a DNS-resolved IP→domain mapping so that subsequent
+// traffic to that IP can be matched against domain-based rules.
+func (m *Matcher) AssociateDomain(ip net.IP, domain string) {
+	if ip == nil || domain == "" {
+		return
+	}
+	m.ipToDomainMu.Lock()
+	m.ipToDomain[ip.String()] = strings.ToLower(domain)
+	m.ipToDomainMu.Unlock()
+}
+
 // Match finds the first matching rule for the given domain and/or IP
 // Returns PolicyDirect if no rules match
 func (m *Matcher) Match(domain string, ip net.IP) MatchResult {
 	domain = strings.ToLower(domain)
+
+	// If no domain was sniffed but we have an IP, check the DNS association cache.
+	if domain == "" && ip != nil {
+		m.ipToDomainMu.RLock()
+		domain = m.ipToDomain[ip.String()]
+		m.ipToDomainMu.RUnlock()
+	}
 
 	var bestRule *Rule
 	bestIndex := -1

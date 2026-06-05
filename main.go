@@ -97,9 +97,14 @@ func main() {
 	}
 
 	// Setup nftables
-	// We intercept both TCP and UDP traffic to the proxy port
+	// Intercept TCP and UDP traffic for HTTP, HTTPS and DNS
+	interceptPorts := cfg.InterceptPorts
+	if len(interceptPorts) == 0 {
+		interceptPorts = []uint16{80, 443, 53}
+	}
 	rules := []iptables.TProxyRule{
-		{Protocols: "tcp", Ports: []uint16{80, 443}, DstPort: uint16(port)},
+		{Protocols: "tcp", Ports: interceptPorts, DstPort: uint16(port)},
+		{Protocols: "udp", Ports: interceptPorts, DstPort: uint16(port)},
 	}
 
 	iptMgr := iptables.NewManager(rules)

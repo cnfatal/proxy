@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"slices"
 	"syscall"
 
@@ -14,9 +15,11 @@ import (
 )
 
 const (
-	tableName       = "transparent_proxy"
-	preroutingChain = "prerouting"
-	outputChain     = "output"
+	tableName               = "transparent_proxy"
+	preroutingChain         = "prerouting"
+	outputChain             = "output"
+	preroutingRedirectChain = "prerouting_redirect"
+	outputRedirectChain     = "output_redirect"
 
 	// FWMark is used to mark packets that should be handled by policy routing
 	FWMark = 0x1
@@ -76,6 +79,10 @@ func (m *Manager) Setup() error {
 	// First cleanup any existing rules
 	m.cleanupExisting()
 
+	if err := m.setupKernelParameters(); err != nil {
+		return fmt.Errorf("failed to setup kernel parameters: %w", err)
+	}
+
 	// Setup policy routing first
 	if err := m.setupPolicyRouting(); err != nil {
 		return fmt.Errorf("failed to setup policy routing: %w", err)
@@ -108,8 +115,27 @@ func (m *Manager) Setup() error {
 	}
 	m.conn.AddChain(preroutingCh)
 
-	// Add bypass rule to OUTPUT chain
+	outputRedirectCh := &nftables.Chain{
+		Name:     outputRedirectChain,
+		Table:    m.table,
+		Type:     nftables.ChainTypeNAT,
+		Hooknum:  nftables.ChainHookOutput,
+		Priority: nftables.ChainPriorityNATDest,
+	}
+	m.conn.AddChain(outputRedirectCh)
+
+	preroutingRedirectCh := &nftables.Chain{
+		Name:     preroutingRedirectChain,
+		Table:    m.table,
+		Type:     nftables.ChainTypeNAT,
+		Hooknum:  nftables.ChainHookPrerouting,
+		Priority: nftables.ChainPriorityNATDest,
+	}
+	m.conn.AddChain(preroutingRedirectCh)
+
+	// Add bypass rules before interception rules.
 	m.addBypassRule(outputCh)
+	m.addBypassRule(outputRedirectCh)
 	if err := m.addDestinationBypassRules(outputCh); err != nil {
 		m.Cleanup()
 		return err
@@ -118,16 +144,36 @@ func (m *Manager) Setup() error {
 		m.Cleanup()
 		return err
 	}
+	if err := m.addDestinationBypassRules(outputRedirectCh); err != nil {
+		m.Cleanup()
+		return err
+	}
+	if err := m.addDestinationBypassRules(preroutingRedirectCh); err != nil {
+		m.Cleanup()
+		return err
+	}
 
 	// Add rules to both chains
 	for _, rule := range m.rules {
-		if err := m.addRule(outputCh, rule, true); err != nil {
-			m.Cleanup()
-			return err
-		}
-		if err := m.addRule(preroutingCh, rule, false); err != nil {
-			m.Cleanup()
-			return err
+		switch rule.Protocols {
+		case "tcp":
+			if err := m.addTCPRedirectRule(outputRedirectCh, rule); err != nil {
+				m.Cleanup()
+				return err
+			}
+			if err := m.addTCPRedirectRule(preroutingRedirectCh, rule); err != nil {
+				m.Cleanup()
+				return err
+			}
+		case "udp":
+			if err := m.addUDPTProxyRule(outputCh, rule, true); err != nil {
+				m.Cleanup()
+				return err
+			}
+			if err := m.addUDPTProxyRule(preroutingCh, rule, false); err != nil {
+				m.Cleanup()
+				return err
+			}
 		}
 	}
 
@@ -138,6 +184,41 @@ func (m *Manager) Setup() error {
 	}
 
 	slog.Info("nftables rules and policy routing configured successfully")
+	return nil
+}
+
+func (m *Manager) setupKernelParameters() error {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return fmt.Errorf("failed to list links: %w", err)
+	}
+
+	names := map[string]struct{}{
+		"all":     {},
+		"default": {},
+		"lo":      {},
+	}
+	for _, link := range links {
+		if attrs := link.Attrs(); attrs != nil && attrs.Name != "" {
+			names[attrs.Name] = struct{}{}
+		}
+	}
+
+	for name := range names {
+		for key, value := range map[string]string{
+			"rp_filter":      "0\n",
+			"src_valid_mark": "1\n",
+		} {
+			path := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/%s", name, key)
+			if err := os.WriteFile(path, []byte(value), 0644); err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return fmt.Errorf("set %s on %s: %w", key, name, err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -228,45 +309,38 @@ func destinationCIDRExprs(cidr string) ([]expr.Any, error) {
 	}, nil
 }
 
-// addRule adds a tproxy rule for a specific chain
-func (m *Manager) addRule(chain *nftables.Chain, r TProxyRule, isOutput bool) error {
-	if r.Protocols == "" {
-		return nil
-	}
-
-	// If no ports specified or contains 0, match all ports (represented by a single rule with port 0)
-	ports := r.Ports
+func normalizedPorts(ports []uint16) []uint16 {
 	if len(ports) == 0 || slices.Contains(ports, 0) {
-		ports = []uint16{0}
+		return []uint16{0}
 	}
+	return ports
+}
 
-	for _, port := range ports {
-		exprs := []expr.Any{}
-
-		// 1. Protocol matching
-		exprs = append(exprs, &expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1})
-		exprs = append(exprs, &expr.Cmp{
-			Op:       expr.CmpOpEq,
+func (m *Manager) addTCPRedirectRule(chain *nftables.Chain, r TProxyRule) error {
+	for _, port := range normalizedPorts(r.Ports) {
+		exprs := protocolPortExprs("tcp", port)
+		exprs = append(exprs, &expr.Immediate{
 			Register: 1,
-			Data:     []byte{ternary(r.Protocols == "udp", byte(17), byte(6))},
+			Data:     binaryPort(r.DstPort),
+		}, &expr.Redir{
+			RegisterProtoMin: 1,
+		}, &expr.Verdict{
+			Kind: expr.VerdictAccept,
 		})
+		m.conn.AddRule(&nftables.Rule{
+			Table: m.table,
+			Chain: chain,
+			Exprs: exprs,
+		})
+	}
+	return nil
+}
 
-		// 2. Port matching (skip if port is 0)
-		if port != 0 {
-			exprs = append(exprs, &expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseTransportHeader,
-				Offset:       2, // Destination port offset in TCP/UDP header
-				Len:          2,
-			})
-			exprs = append(exprs, &expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     binaryPort(port),
-			})
-		}
+// addUDPTProxyRule adds a UDP tproxy rule for a specific chain.
+func (m *Manager) addUDPTProxyRule(chain *nftables.Chain, r TProxyRule, isOutput bool) error {
+	for _, port := range normalizedPorts(r.Ports) {
+		exprs := protocolPortExprs("udp", port)
 
-		// 3. Set mark
 		exprs = append(exprs, &expr.Immediate{
 			Register: 1,
 			Data:     binaryUint32(FWMark),
@@ -340,6 +414,33 @@ func (m *Manager) addRule(chain *nftables.Chain, r TProxyRule, isOutput bool) er
 	}
 
 	return nil
+}
+
+func protocolPortExprs(protocol string, port uint16) []expr.Any {
+	exprs := []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     []byte{ternary(protocol == "udp", byte(17), byte(6))},
+		},
+	}
+	if port == 0 {
+		return exprs
+	}
+	return append(exprs,
+		&expr.Payload{
+			DestRegister: 1,
+			Base:         expr.PayloadBaseTransportHeader,
+			Offset:       2,
+			Len:          2,
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     binaryPort(port),
+		},
+	)
 }
 
 // setupPolicyRouting configures ip rule and routing table

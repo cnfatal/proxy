@@ -34,6 +34,10 @@ type Config struct {
 	// Log level (debug, info, warn, error)
 	LogLevel string `yaml:"log_level"`
 
+	// InterceptPorts lists the TCP/UDP destination ports to intercept.
+	// Defaults to [80, 443, 53]. Use [0] to intercept all ports.
+	InterceptPorts []uint16 `yaml:"intercept_ports"`
+
 	// Parsed upstream URL
 	UpstreamURL *url.URL `yaml:"-"`
 }

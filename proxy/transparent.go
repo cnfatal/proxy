@@ -11,10 +11,12 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/cnfatal/proxy/config"
 	"github.com/cnfatal/proxy/rules"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -148,6 +150,8 @@ func (tp *TransparentProxy) runUDP(ctx context.Context) error {
 
 	slog.Info("Transparent UDP proxy listening", "addr", tp.listenAddr)
 
+	listenPort, _ := GetListenPort(tp.listenAddr)
+
 	go tp.cleanupUDPSessions(ctx)
 
 	go func() {
@@ -155,11 +159,11 @@ func (tp *TransparentProxy) runUDP(ctx context.Context) error {
 		udpConn.Close()
 	}()
 
-	tp.udpLoop(ctx)
+	tp.udpLoop(ctx, listenPort)
 	return nil
 }
 
-func (tp *TransparentProxy) udpLoop(ctx context.Context) {
+func (tp *TransparentProxy) udpLoop(ctx context.Context, listenPort int) {
 	buf := make([]byte, 65535)
 	oob := make([]byte, 1024)
 	for {
@@ -177,12 +181,10 @@ func (tp *TransparentProxy) udpLoop(ctx context.Context) {
 			continue
 		}
 
-		// Loop detection: if the original destination is the proxy itself, ignore it
-		listenPort, _ := GetListenPort(tp.listenAddr)
+		// Loop detection: drop any packet whose original destination port is the
+		// proxy's own listen port to prevent forwarding loops.
 		if origDst.Port == listenPort {
-			if origDst.IP.IsLoopback() || origDst.IP.IsUnspecified() {
-				continue
-			}
+			continue
 		}
 
 		data := make([]byte, n)
@@ -256,7 +258,10 @@ func (tp *TransparentProxy) handleGeneralUDP(ctx context.Context, srcAddr net.Ad
 		tp.udpSessions[key] = session
 		tp.udpMu.Unlock()
 
-		// Start relay from remote to client
+		// Start relay from remote to client.
+		// We must send the reply with a source address matching origDst so the
+		// client sees the packet as coming from the real server (transparent).
+		// This requires a UDP socket bound to origDst with IP_TRANSPARENT.
 		go func() {
 			buf := make([]byte, 65535)
 			for {
@@ -269,8 +274,12 @@ func (tp *TransparentProxy) handleGeneralUDP(ctx context.Context, srcAddr net.Ad
 				session.lastActive = time.Now()
 				tp.udpMu.Unlock()
 
-				if _, err := tp.udpConn.WriteTo(buf[:n], srcAddr); err != nil {
-					return
+				if err := sendUDPSpoofed(origDst, srcAddr.(*net.UDPAddr), buf[:n]); err != nil {
+					slog.Debug("UDP spoofed send failed, falling back", "error", err)
+					// Fallback: send from proxy address (breaks transparency but keeps connectivity)
+					if _, err := tp.udpConn.WriteTo(buf[:n], srcAddr); err != nil {
+						return
+					}
 				}
 			}
 		}()
@@ -287,6 +296,25 @@ func (tp *TransparentProxy) upstreamScheme() string {
 		return ""
 	}
 	return tp.upstream.url.Scheme
+}
+
+// sendUDPSpoofed sends a UDP packet with a spoofed source address (origDst → client).
+// This requires IP_TRANSPARENT on the socket so the kernel accepts the non-local source bind.
+func sendUDPSpoofed(src, dst *net.UDPAddr, data []byte) error {
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				syscall.SetsockoptInt(int(fd), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1)
+			})
+		},
+	}
+	conn, err := lc.ListenPacket(context.Background(), "udp", src.String())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_, err = conn.WriteTo(data, dst)
+	return err
 }
 
 func (tp *TransparentProxy) cleanupUDPSessions(ctx context.Context) {
@@ -314,7 +342,9 @@ func (tp *TransparentProxy) cleanupUDPSessions(ctx context.Context) {
 // handleConnection handles a single incoming connection
 func (tp *TransparentProxy) handleConnection(ctx context.Context, client net.Conn) {
 	defer func() {
-		client.Close()
+		if client != nil {
+			client.Close()
+		}
 	}()
 
 	// Set TCP_NODELAY to reduce latency
@@ -322,26 +352,25 @@ func (tp *TransparentProxy) handleConnection(ctx context.Context, client net.Con
 		tcpConn.SetNoDelay(true)
 	}
 
-	// Get the original destination address
-	origDst, ok := client.LocalAddr().(*net.TCPAddr)
-	if !ok {
-		slog.Error("Failed to get original destination: not a TCP address")
+	origDst, err := originalTCPDestination(client)
+	if err != nil {
+		slog.Error("Failed to get original destination", "error", err)
 		return
 	}
 
-	// Loop detection: if the original destination is the proxy itself, ignore it
-	// This happens if a connection is made directly to the proxy port
+	// Loop detection: drop any connection whose original destination port is the
+	// proxy's own listen port to prevent forwarding loops.
 	listenPort, _ := GetListenPort(tp.listenAddr)
 	if origDst.Port == listenPort {
-		if origDst.IP.IsLoopback() || origDst.IP.IsUnspecified() {
-			slog.Debug("Ignoring direct connection to proxy port", "addr", origDst.String())
-			return
-		}
+		slog.Debug("Ignoring direct connection to proxy port", "addr", origDst.String())
+		return
 	}
 
 	if origDst.Port == 53 {
+		// handleDNSTCP closes the connection; suppress our own deferred close.
 		tp.handleDNSTCP(ctx, client)
-		return // client will be closed by handleDNSTCP
+		client = nil
+		return
 	}
 
 	targetAddr := origDst.String()
@@ -397,6 +426,64 @@ func (tp *TransparentProxy) handleConnection(ctx context.Context, client net.Con
 	Relay(serverConn, client, tp.pool)
 
 	slog.Debug("Relay completed", "target", targetAddr)
+}
+
+func originalTCPDestination(conn net.Conn) (*net.TCPAddr, error) {
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return nil, fmt.Errorf("not a TCP connection: %T", conn)
+	}
+
+	if addr, err := originalTCPDestinationFromSocket(tcpConn); err == nil {
+		return addr, nil
+	}
+
+	addr, ok := conn.LocalAddr().(*net.TCPAddr)
+	if !ok {
+		return nil, fmt.Errorf("local address is not TCP: %T", conn.LocalAddr())
+	}
+	return addr, nil
+}
+
+func originalTCPDestinationFromSocket(conn *net.TCPConn) (*net.TCPAddr, error) {
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+
+	var addr *net.TCPAddr
+	var sockErr error
+	if err := rawConn.Control(func(fd uintptr) {
+		addr, sockErr = getIPv4OriginalDst(int(fd))
+	}); err != nil {
+		return nil, err
+	}
+	if sockErr != nil {
+		return nil, sockErr
+	}
+	return addr, nil
+}
+
+func getIPv4OriginalDst(fd int) (*net.TCPAddr, error) {
+	var raw syscall.RawSockaddrInet4
+	size := uint32(unsafe.Sizeof(raw))
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_GETSOCKOPT,
+		uintptr(fd),
+		uintptr(syscall.SOL_IP),
+		uintptr(unix.SO_ORIGINAL_DST),
+		uintptr(unsafe.Pointer(&raw)),
+		uintptr(unsafe.Pointer(&size)),
+		0,
+	)
+	if errno != 0 {
+		return nil, errno
+	}
+
+	return &net.TCPAddr{
+		IP:   net.IPv4(raw.Addr[0], raw.Addr[1], raw.Addr[2], raw.Addr[3]),
+		Port: int(binary.BigEndian.Uint16((*[2]byte)(unsafe.Pointer(&raw.Port))[:])),
+	}, nil
 }
 
 func buildUpstreamTargetAddr(domain string, origDst *net.TCPAddr) string {
